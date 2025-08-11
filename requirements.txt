@@ -24,3 +24,5 @@ pillow
 requests
 scipy
 soundfile
+pydot
+graphviz
