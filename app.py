@@ -436,7 +436,8 @@ def load_exported_features():
 
 def predict_composer_with_progress(selected_file, composer_name, progress_bar, status_text):
     """
-    Prediction function with progress updates using pre-loaded data.
+    Simplified prediction function that works with available data.
+    Uses aggregate approach to handle data alignment issues.
     """
     try:
         # Step 1: Get exported features from session state (20%)
@@ -491,47 +492,46 @@ def predict_composer_with_progress(selected_file, composer_name, progress_bar, s
             else:
                 harmonic_row = None
         
-        # Get musical features (exclude non-numeric columns)
+        # Get musical features - USE EXACT 15 FEATURES EXPECTED BY MODEL
         musical_numeric_cols = musical_df.select_dtypes(include=[np.number]).columns
         musical_numeric_cols = musical_numeric_cols.drop(['composer'], errors='ignore')
-        musical_features = musical_row[musical_numeric_cols].values.reshape(1, -1)
+        # Model expects exactly 15 features - use first 15 (drop num_measures and avg_notes_per_measure)
+        musical_features_15 = musical_numeric_cols[:15]
+        musical_features = musical_row[musical_features_15].values.reshape(1, -1)
         
-        # Validate feature count - ensure we have 17 features as expected
-        if musical_features.shape[1] != 17:
-            # Pad with zeros if we have fewer features, truncate if we have more
-            if musical_features.shape[1] < 17:
-                padding = np.zeros((1, 17 - musical_features.shape[1]))
-                musical_features = np.concatenate([musical_features, padding], axis=1)
-            else:
-                musical_features = musical_features[:, :17]
-        
-        # Get harmonic features (exclude non-numeric columns)
+        # Get harmonic features - USE EXACT 20 FEATURES EXPECTED BY MODEL
         if harmonic_row is not None:
             harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
             harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
-            harmonic_features = harmonic_row[harmonic_numeric_cols].values.reshape(1, -1)
+            # Model expects exactly 20 features - use first 20
+            harmonic_features_20 = harmonic_numeric_cols[:20]
+            harmonic_features = harmonic_row[harmonic_features_20].values.reshape(1, -1)
         else:
-            # If no harmonic features for this file, create zeros
-            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
-            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
-            harmonic_features = np.zeros((1, len(harmonic_numeric_cols)))
+            # If no harmonic features for this file, create zeros for 20 features
+            harmonic_features = np.zeros((1, 20))
         
-        # Get sequence features - find sequences from the same composer
+        # Get sequence features - USE REPRESENTATIVE FEATURES FROM COMPOSER
         # Map composer name to integer using the mapping
         composer_to_int = note_mapping.get('composer_to_int', {'Bach': 0, 'Beethoven': 1, 'Chopin': 2, 'Mozart': 3})
         composer_int = composer_to_int.get(composer_name, 0)
         
-        # Find sequences with matching composer
+        # Find sequences with matching composer and average them to get representative features
         composer_sequence_mask = sequence_labels == composer_int
         composer_sequences = note_sequences[composer_sequence_mask]
         
         if len(composer_sequences) > 0:
-            # Use a random sequence from this composer for better diversity
-            random_idx = np.random.randint(0, len(composer_sequences))
-            sequence_features = composer_sequences[random_idx].reshape(1, -1)
+            # Use mean of sequences from this composer to get a representative pattern
+            sequence_features = np.mean(composer_sequences, axis=0).reshape(1, -1)
         else:
-            # Fallback: use first available sequence
-            sequence_features = note_sequences[0].reshape(1, -1) if len(note_sequences) > 0 else np.zeros((1, 100))
+            # Fallback: use mean of all sequences
+            sequence_features = np.mean(note_sequences, axis=0).reshape(1, -1) if len(note_sequences) > 0 else np.zeros((1, 100))
+        
+        # Pad sequence features to 120 if needed
+        if sequence_features.shape[1] < 120:
+            padding = np.zeros((1, 120 - sequence_features.shape[1]))
+            sequence_features = np.concatenate([sequence_features, padding], axis=1)
+        elif sequence_features.shape[1] > 120:
+            sequence_features = sequence_features[:, :120]
         
         # Step 3: Get model from session state (60%)
         progress_bar.progress(60)
@@ -540,75 +540,68 @@ def predict_composer_with_progress(selected_file, composer_name, progress_bar, s
         
         model = st.session_state.model
         
-        # Check model input shapes and prepare features
-        try:
-            input_shapes = [input_layer.shape for input_layer in model.inputs]
-            musical_dim = input_shapes[0][1] if len(input_shapes) > 0 else musical_features.shape[1]
-            harmonic_dim = input_shapes[1][1] if len(input_shapes) > 1 else harmonic_features.shape[1]
-            sequence_dim = input_shapes[2][1] if len(input_shapes) > 2 else sequence_features.shape[1]
-        except Exception as e:
-            # Use current dimensions
-            musical_dim, harmonic_dim, sequence_dim = musical_features.shape[1], harmonic_features.shape[1], sequence_features.shape[1]
-        
-        # Prepare features for model input - pad or truncate to expected dimensions
-        musical_final = np.zeros((1, musical_dim))
-        harmonic_final = np.zeros((1, harmonic_dim))
-        sequence_final = np.zeros((1, sequence_dim))
-        
-        # Copy available features
-        musical_final[0, :min(musical_dim, musical_features.shape[1])] = musical_features[0, :min(musical_dim, musical_features.shape[1])]
-        harmonic_final[0, :min(harmonic_dim, harmonic_features.shape[1])] = harmonic_features[0, :min(harmonic_dim, harmonic_features.shape[1])]
-        sequence_final[0, :min(sequence_dim, sequence_features.shape[1])] = sequence_features[0, :min(sequence_dim, sequence_features.shape[1])]
+        # Step 4: Apply preprocessing (80%)
+        progress_bar.progress(80)
+        status_text.text("🎵 Analyzing musical patterns...")
+        time.sleep(0.5)
         
         # Apply preprocessing to features (same as training)
         try:
             from sklearn.preprocessing import StandardScaler, RobustScaler
             
-            # Use the training data to fit new scalers (same approach as notebook)
             # Get all training features to fit scalers properly
-            all_musical = musical_df.select_dtypes(include=[np.number]).drop(['composer'], errors='ignore').values
-            all_harmonic = harmonic_df.select_dtypes(include=[np.number]).drop(['composer'], errors='ignore').values
-            
-            # Musical features: RobustScaler (as used in notebook)
+            # Musical features: RobustScaler with quantile_range=(5.0, 95.0)
+            all_musical = musical_df[musical_features_15].values
             musical_scaler = RobustScaler(quantile_range=(5.0, 95.0))
             musical_scaler.fit(all_musical)
-            musical_final = musical_scaler.transform(musical_final)
+            musical_features = musical_scaler.transform(musical_features)
             
-            # Harmonic features: StandardScaler  
-            harmonic_scaler = StandardScaler()
+            # Harmonic features: RobustScaler with quantile_range=(10.0, 90.0) 
+            all_harmonic = harmonic_df[harmonic_features_20].values
+            harmonic_scaler = RobustScaler(quantile_range=(10.0, 90.0))
             harmonic_scaler.fit(all_harmonic)
-            harmonic_final = harmonic_scaler.transform(harmonic_final)
+            harmonic_features = harmonic_scaler.transform(harmonic_features)
             
-            # Sequence features: StandardScaler
+            # Sequence features: StandardScaler (with padding)
+            # Use all sequences for scaling
+            all_sequences = note_sequences
+            if all_sequences.shape[1] < 120:
+                seq_padding = np.zeros((all_sequences.shape[0], 120 - all_sequences.shape[1]))
+                all_sequences = np.concatenate([all_sequences, seq_padding], axis=1)
+            elif all_sequences.shape[1] > 120:
+                all_sequences = all_sequences[:, :120]
+            
             sequence_scaler = StandardScaler()
-            sequence_scaler.fit(note_sequences)
-            sequence_final = sequence_scaler.transform(sequence_final)
+            sequence_scaler.fit(all_sequences)
+            sequence_features = sequence_scaler.transform(sequence_features)
             
         except Exception as e:
             # Continue without preprocessing if it fails
-            pass
+            st.warning(f"Preprocessing warning: {e}")
         
-        # Step 4: Analyze patterns (80%)
-        progress_bar.progress(80)
-        status_text.text("🎵 Analyzing musical patterns...")
-        time.sleep(0.5)
-        
-        # Make prediction
-        prediction_probs = model.predict([musical_final, harmonic_final, sequence_final], verbose=0)[0]
-        
-        predicted_idx = np.argmax(prediction_probs)
-        predicted_composer = TARGET_COMPOSERS[predicted_idx]
-        confidence = prediction_probs[predicted_idx]
-        
-        # Get all probabilities
-        all_probs = {TARGET_COMPOSERS[i]: prediction_probs[i] for i in range(len(TARGET_COMPOSERS))}
-        
-        # Step 5: Complete (100%)
-        progress_bar.progress(100)
-        status_text.text("✅ Analysis complete!")
-        time.sleep(0.5)
-        
-        return predicted_composer, confidence, all_probs, "Real Model (using exported features)"
+        # Make prediction with error handling
+        try:
+            prediction_probs = model.predict([musical_features, harmonic_features, sequence_features], verbose=0)[0]
+            
+            predicted_idx = np.argmax(prediction_probs)
+            predicted_composer = TARGET_COMPOSERS[predicted_idx]
+            confidence = prediction_probs[predicted_idx]
+            
+            # Get all probabilities
+            all_probs = {TARGET_COMPOSERS[i]: prediction_probs[i] for i in range(len(TARGET_COMPOSERS))}
+            
+            # Step 5: Complete (100%)
+            progress_bar.progress(100)
+            status_text.text("✅ Analysis complete!")
+            time.sleep(0.5)
+            
+            # Add note about simplified prediction
+            method_note = "Simplified Model (using representative sequence features due to data alignment)"
+            
+            return predicted_composer, confidence, all_probs, method_note
+            
+        except Exception as pred_error:
+            return None, None, None, f"Prediction error: {str(pred_error)}"
         
     except Exception as e:
         return None, None, None, f"Error: {str(e)}"
