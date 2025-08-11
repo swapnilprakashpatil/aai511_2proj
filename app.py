@@ -7,16 +7,13 @@ import pickle
 import os
 import glob
 from pathlib import Path
-import requests
 from PIL import Image
-import base64
 import pretty_midi
 import tempfile
 import io
 import time
 import music21
 from music21 import converter, corpus, instrument, midi, note, chord, pitch, stream
-import librosa
 import soundfile as sf
 import warnings
 warnings.filterwarnings('ignore')
@@ -499,6 +496,15 @@ def predict_composer_with_progress(selected_file, composer_name, progress_bar, s
         musical_numeric_cols = musical_numeric_cols.drop(['composer'], errors='ignore')
         musical_features = musical_row[musical_numeric_cols].values.reshape(1, -1)
         
+        # Validate feature count - ensure we have 17 features as expected
+        if musical_features.shape[1] != 17:
+            # Pad with zeros if we have fewer features, truncate if we have more
+            if musical_features.shape[1] < 17:
+                padding = np.zeros((1, 17 - musical_features.shape[1]))
+                musical_features = np.concatenate([musical_features, padding], axis=1)
+            else:
+                musical_features = musical_features[:, :17]
+        
         # Get harmonic features (exclude non-numeric columns)
         if harmonic_row is not None:
             harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
@@ -554,6 +560,34 @@ def predict_composer_with_progress(selected_file, composer_name, progress_bar, s
         harmonic_final[0, :min(harmonic_dim, harmonic_features.shape[1])] = harmonic_features[0, :min(harmonic_dim, harmonic_features.shape[1])]
         sequence_final[0, :min(sequence_dim, sequence_features.shape[1])] = sequence_features[0, :min(sequence_dim, sequence_features.shape[1])]
         
+        # Apply preprocessing to features (same as training)
+        try:
+            from sklearn.preprocessing import StandardScaler, RobustScaler
+            
+            # Use the training data to fit new scalers (same approach as notebook)
+            # Get all training features to fit scalers properly
+            all_musical = musical_df.select_dtypes(include=[np.number]).drop(['composer'], errors='ignore').values
+            all_harmonic = harmonic_df.select_dtypes(include=[np.number]).drop(['composer'], errors='ignore').values
+            
+            # Musical features: RobustScaler (as used in notebook)
+            musical_scaler = RobustScaler(quantile_range=(5.0, 95.0))
+            musical_scaler.fit(all_musical)
+            musical_final = musical_scaler.transform(musical_final)
+            
+            # Harmonic features: StandardScaler  
+            harmonic_scaler = StandardScaler()
+            harmonic_scaler.fit(all_harmonic)
+            harmonic_final = harmonic_scaler.transform(harmonic_final)
+            
+            # Sequence features: StandardScaler
+            sequence_scaler = StandardScaler()
+            sequence_scaler.fit(note_sequences)
+            sequence_final = sequence_scaler.transform(sequence_final)
+            
+        except Exception as e:
+            # Continue without preprocessing if it fails
+            pass
+        
         # Step 4: Analyze patterns (80%)
         progress_bar.progress(80)
         status_text.text("🎵 Analyzing musical patterns...")
@@ -573,125 +607,6 @@ def predict_composer_with_progress(selected_file, composer_name, progress_bar, s
         progress_bar.progress(100)
         status_text.text("✅ Analysis complete!")
         time.sleep(0.5)
-        
-        return predicted_composer, confidence, all_probs, "Real Model (using exported features)"
-        
-    except Exception as e:
-        return None, None, None, f"Error: {str(e)}"
-
-def predict_composer_real(selected_file, composer_name):
-    """
-    Real prediction function using pre-loaded exported features and model.
-    """
-    try:
-        # Get exported features from session state
-        exported_features = st.session_state.exported_features
-        musical_df = exported_features['musical_df']
-        harmonic_df = exported_features['harmonic_df']
-        note_sequences = exported_features['note_sequences']
-        sequence_labels = exported_features['sequence_labels']
-        note_mapping = exported_features.get('note_mapping', {})
-        
-        # Try to find the file in the musical features dataframe
-        file_matches = []
-        
-        # Strategy 1: Exact filename match
-        file_matches.extend(musical_df[musical_df['filename'] == selected_file].index.tolist())
-        
-        # Strategy 2: Check if the file path contains our file
-        if not file_matches:
-            file_matches.extend(musical_df[musical_df['file_path'].str.contains(selected_file, na=False)].index.tolist())
-        
-        # Strategy 3: Check for partial filename match (without extension)
-        if not file_matches:
-            base_name = selected_file.replace('.mid', '').replace('.midi', '')
-            file_matches.extend(musical_df[musical_df['filename'].str.contains(base_name, na=False)].index.tolist())
-        
-        if not file_matches:
-            return None, None, None, f"File '{selected_file}' not found in exported features"
-        
-        # Use the first match
-        file_idx = file_matches[0]
-        
-        # Extract features for this specific file
-        musical_row = musical_df.iloc[file_idx]
-        
-        # Find corresponding harmonic features (match by file index)
-        if file_idx < len(harmonic_df):
-            harmonic_row = harmonic_df.iloc[file_idx]
-        else:
-            # Find by filename if direct index doesn't work
-            harmonic_matches = harmonic_df[harmonic_df['filename'] == selected_file]
-            if len(harmonic_matches) > 0:
-                harmonic_row = harmonic_matches.iloc[0]
-            else:
-                harmonic_row = None
-        
-        # Get musical features (exclude non-numeric columns)
-        musical_numeric_cols = musical_df.select_dtypes(include=[np.number]).columns
-        musical_numeric_cols = musical_numeric_cols.drop(['composer'], errors='ignore')
-        musical_features = musical_row[musical_numeric_cols].values.reshape(1, -1)
-        
-        # Get harmonic features (exclude non-numeric columns)
-        if harmonic_row is not None:
-            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
-            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
-            harmonic_features = harmonic_row[harmonic_numeric_cols].values.reshape(1, -1)
-        else:
-            # If no harmonic features for this file, create zeros
-            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
-            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
-            harmonic_features = np.zeros((1, len(harmonic_numeric_cols)))
-        
-        # Get sequence features - find sequences from the same composer
-        # Map composer name to integer using the mapping
-        composer_to_int = note_mapping.get('composer_to_int', {'Bach': 0, 'Beethoven': 1, 'Chopin': 2, 'Mozart': 3})
-        composer_int = composer_to_int.get(composer_name, 0)
-        
-        # Find sequences with matching composer
-        composer_sequence_mask = sequence_labels == composer_int
-        composer_sequences = note_sequences[composer_sequence_mask]
-        
-        if len(composer_sequences) > 0:
-            # Use a random sequence from this composer for better diversity
-            random_idx = np.random.randint(0, len(composer_sequences))
-            sequence_features = composer_sequences[random_idx].reshape(1, -1)
-        else:
-            # Fallback: use first available sequence
-            sequence_features = note_sequences[0].reshape(1, -1) if len(note_sequences) > 0 else np.zeros((1, 100))
-        
-        # Get model from session state
-        model = st.session_state.model
-        
-        # Check model input shapes and prepare features
-        try:
-            input_shapes = [input_layer.shape for input_layer in model.inputs]
-            musical_dim = input_shapes[0][1] if len(input_shapes) > 0 else musical_features.shape[1]
-            harmonic_dim = input_shapes[1][1] if len(input_shapes) > 1 else harmonic_features.shape[1]
-            sequence_dim = input_shapes[2][1] if len(input_shapes) > 2 else sequence_features.shape[1]
-        except Exception as e:
-            # Use current dimensions
-            musical_dim, harmonic_dim, sequence_dim = musical_features.shape[1], harmonic_features.shape[1], sequence_features.shape[1]
-        
-        # Prepare features for model input - pad or truncate to expected dimensions
-        musical_final = np.zeros((1, musical_dim))
-        harmonic_final = np.zeros((1, harmonic_dim))
-        sequence_final = np.zeros((1, sequence_dim))
-        
-        # Copy available features
-        musical_final[0, :min(musical_dim, musical_features.shape[1])] = musical_features[0, :min(musical_dim, musical_features.shape[1])]
-        harmonic_final[0, :min(harmonic_dim, harmonic_features.shape[1])] = harmonic_features[0, :min(harmonic_dim, harmonic_features.shape[1])]
-        sequence_final[0, :min(sequence_dim, sequence_features.shape[1])] = sequence_features[0, :min(sequence_dim, sequence_features.shape[1])]
-        
-        # Make prediction
-        prediction_probs = model.predict([musical_final, harmonic_final, sequence_final], verbose=0)[0]
-        
-        predicted_idx = np.argmax(prediction_probs)
-        predicted_composer = TARGET_COMPOSERS[predicted_idx]
-        confidence = prediction_probs[predicted_idx]
-        
-        # Get all probabilities
-        all_probs = {TARGET_COMPOSERS[i]: prediction_probs[i] for i in range(len(TARGET_COMPOSERS))}
         
         return predicted_composer, confidence, all_probs, "Real Model (using exported features)"
         
