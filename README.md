@@ -39,6 +39,8 @@ Identifying the composer of classical music pieces can be challenging, especiall
 
 ## Detailed Document
 
+https://swapnilprakashpatil.github.io/aai511_2proj/FinalProject-7.2-Section%205-Team%202.html
+
 [Complete Project Notebook](./FinalProject-7.2-Section%205-Team%202.ipynb)
 
 ## Project Architecture
