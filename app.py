@@ -1,705 +1,1032 @@
 import streamlit as st
-import os
 import numpy as np
 import pandas as pd
-import pickle
 import tensorflow as tf
 from tensorflow import keras
+import pickle
+import os
+import glob
+from pathlib import Path
 import requests
-from io import BytesIO
 from PIL import Image
-import pretty_midi
-from music21 import converter, note, chord
-import time
-import random
 import base64
+import pretty_midi
+import tempfile
+import io
+import time
+import music21
+from music21 import converter, corpus, instrument, midi, note, chord, pitch, stream
+import librosa
+import soundfile as sf
 import warnings
 warnings.filterwarnings('ignore')
 
-# Configure page
+# Set page config
 st.set_page_config(
-    page_title="🎼 Composer Prediction App",
-    page_icon="🎼",
+    page_title="🎼 Classical Composer Identifier",
+    page_icon="🎵",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- CONSTANTS ---
-DATA_DIR = "data/midiclassics"
-MODEL_PATH = "data/model/composer_classification_model_best.keras"
-ARTIFACTS_PATH = "data/model/composer_classification_model_artifacts.pkl"
-FEATURES_DIR = "data/features"  # Added features directory
-
-# Composer information with Wikipedia images
-COMPOSER_INFO = {
-    "Bach": {
-        "full_name": "Johann Sebastian Bach",
-        "years": "1685-1750",
-        "image_url": "https://upload.wikimedia.org/wikipedia/commons/6/6a/Johann_Sebastian_Bach.jpg",
-        "description": "German composer and musician of the Baroque period, known for complex fugues and mathematical precision."
-    },
-    "Beethoven": {
-        "full_name": "Ludwig van Beethoven", 
-        "years": "1770-1827",
-        "image_url": "https://upload.wikimedia.org/wikipedia/commons/6/6f/Beethoven.jpg",
-        "description": "German composer and pianist who bridged Classical and Romantic periods, famous for his nine symphonies."
-    },
-    "Mozart": {
-        "full_name": "Wolfgang Amadeus Mozart",
-        "years": "1756-1791", 
-        "image_url": "https://upload.wikimedia.org/wikipedia/commons/1/1e/Wolfgang-amadeus-mozart_1.jpg",
-        "description": "Austrian composer of the Classical period, known for his prodigious talent and elegant compositions."
-    },
-    "Chopin": {
-        "full_name": "Frédéric Chopin",
-        "years": "1810-1849",
-        "image_url": "https://upload.wikimedia.org/wikipedia/commons/e/e8/Frederic_Chopin_photo.jpeg",
-        "description": "Polish composer and virtuoso pianist of the Romantic period, famous for his piano compositions."
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        text-align: center;
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 2rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
     }
+    
+    .composer-card {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #667eea;
+        margin: 1rem 0;
+    }
+    
+    .metric-card {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        text-align: center;
+    }
+    
+    .prediction-result {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 2rem;
+        border-radius: 10px;
+        text-align: center;
+        margin: 1rem 0;
+    }
+    
+    .warning-box {
+        background: #fff3cd;
+        border: 1px solid #ffeaa7;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 1rem 0;
+        color: #856404;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Constants
+TARGET_COMPOSERS = ['Bach', 'Beethoven', 'Chopin', 'Mozart']
+DATA_DIR = Path("data")
+MODEL_DIR = DATA_DIR / "model"
+FEATURES_DIR = DATA_DIR / "features"
+IMAGES_DIR = DATA_DIR / "images"
+MIDI_DIR = DATA_DIR / "midiclassics"
+
+# Wikipedia info for composers
+COMPOSER_INFO = {
+    'Bach': """
+    **Johann Sebastian Bach (1685-1750)** 🎼
+    
+    German composer and musician of the late Baroque period. Known for his complex 
+    polyphonic compositions, Bach created timeless masterpieces including the 
+    Brandenburg Concertos, The Well-Tempered Clavier, and Mass in B minor. His works 
+    demonstrate mathematical precision combined with profound emotional depth.
+    
+    **Style:** Complex counterpoint, intricate fugues, mathematical structures
+    """,
+    
+    'Beethoven': """
+    **Ludwig van Beethoven (1770-1827)** 🎵
+    
+    German composer who bridged the Classical and Romantic eras. Despite progressive 
+    hearing loss, Beethoven composed nine symphonies, 32 piano sonatas, and numerous 
+    chamber works. His music is characterized by dramatic contrasts, innovative 
+    structures, and emotional intensity.
+    
+    **Style:** Dramatic dynamics, innovative forms, emotional expression
+    """,
+    
+    'Chopin': """
+    **Frédéric Chopin (1810-1849)** 🎹
+    
+    Polish composer and virtuoso pianist of the Romantic era. Chopin wrote primarily 
+    for solo piano, creating works of extraordinary technical brilliance and poetic 
+    beauty. His compositions include ballades, nocturnes, études, and polonaises that 
+    showcase the piano's expressive capabilities.
+    
+    **Style:** Lyrical melodies, sophisticated harmonies, pianistic virtuosity
+    """,
+    
+    'Mozart': """
+    **Wolfgang Amadeus Mozart (1756-1791)** 🎶
+    
+    Austrian composer of the Classical period, renowned for his prodigious talent and 
+    prolific output. Mozart composed over 600 works including symphonies, operas, 
+    chamber music, and concertos. His music exemplifies clarity, balance, and 
+    effortless melodic beauty.
+    
+    **Style:** Elegant melodies, perfect formal balance, classical clarity
+    """
 }
 
-# --- CACHE FUNCTIONS ---
-@st.cache_resource
-def load_model_and_artifacts():
-    """Load the trained model and artifacts"""
+@st.cache_data
+def load_all_app_data():
+    """Load all required data for the application: model, features, and MIDI files"""
+    with st.spinner("🎵 Loading AI model and features..."):
+        # Load model
+        model_path = MODEL_DIR / "composer_classification_model_best.keras"
+        if not model_path.exists():
+            st.error(f"Model file not found at {model_path}")
+            return None, None, None
+            
+        model = keras.models.load_model(model_path)
+        
+        # Load exported features
+        try:
+            musical_df = pd.read_pickle(FEATURES_DIR / "musical_features_df.pkl")
+            harmonic_df = pd.read_pickle(FEATURES_DIR / "harmonic_features_df.pkl")
+            note_sequences = np.load(FEATURES_DIR / "note_sequences.npy")
+            sequence_labels = np.load(FEATURES_DIR / "sequence_labels.npy")
+            
+            # Load note mapping if available
+            try:
+                with open(FEATURES_DIR / "note_mapping.pkl", 'rb') as f:
+                    note_mapping = pickle.load(f)
+            except:
+                note_mapping = None
+            
+            exported_features = {
+                'musical_df': musical_df,
+                'harmonic_df': harmonic_df,
+                'note_sequences': note_sequences,
+                'sequence_labels': sequence_labels,
+                'note_mapping': note_mapping
+            }
+        except Exception as e:
+            st.error(f"Error loading exported features: {str(e)}")
+            return None, None, None
+        
+        # Load MIDI files
+        midi_files = {}
+        for composer in TARGET_COMPOSERS:
+            composer_dir = MIDI_DIR / composer
+            if composer_dir.exists():
+                midi_files[composer] = [f.name for f in composer_dir.glob("*.mid")]
+            else:
+                midi_files[composer] = []
+        
+        return model, exported_features, midi_files
+
+@st.cache_data
+def load_model_and_features():
+    """Load the trained model"""
     try:
-        if not os.path.exists(MODEL_PATH):
-            st.error(f"Model file not found at {MODEL_PATH}")
+        # Load model
+        model_path = MODEL_DIR / "composer_classification_model_best.keras"
+        if not model_path.exists():
+            st.error(f"Model file not found at {model_path}")
             return None, None
             
-        model = keras.models.load_model(MODEL_PATH)
+        model = keras.models.load_model(model_path)
         
-        # For artifacts, we'll create a simple mapping since the pickle might have custom classes
-        composer_names = ["Bach", "Beethoven", "Chopin", "Mozart"]
-        artifacts = {"composer_names": composer_names}
+        # Check what data files are available
+        files_exist = {}
+        loaded_data = {}
         
-        return model, artifacts
+        # Try to load feature files (for informational purposes)
+        musical_features_path = FEATURES_DIR / "musical_features_df.pkl"
+        if musical_features_path.exists():
+            files_exist['musical'] = True
+            try:
+                with open(musical_features_path, 'rb') as f:
+                    loaded_data['musical'] = pickle.load(f)
+            except:
+                files_exist['musical'] = False
+        else:
+            files_exist['musical'] = False
+        
+        harmonic_features_path = FEATURES_DIR / "harmonic_features_df.pkl"
+        if harmonic_features_path.exists():
+            files_exist['harmonic'] = True
+            try:
+                with open(harmonic_features_path, 'rb') as f:
+                    loaded_data['harmonic'] = pickle.load(f)
+            except:
+                files_exist['harmonic'] = False
+        else:
+            files_exist['harmonic'] = False
+        
+        return model, {'files_exist': files_exist, 'data': loaded_data}
+        
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
         return None, None
 
 @st.cache_data
-def load_extracted_features():
-    """Load pre-extracted features from the features folder"""
-    try:
-        musical_path = os.path.join(FEATURES_DIR, "musical_features_df.pkl")
-        harmonic_path = os.path.join(FEATURES_DIR, "harmonic_features_df.pkl")
-        note_mapping_path = os.path.join(FEATURES_DIR, "note_mapping.pkl")
-        sequences_path = os.path.join(FEATURES_DIR, "note_sequences.npy")
-        labels_path = os.path.join(FEATURES_DIR, "sequence_labels.npy")
-        
-        if not all(os.path.exists(p) for p in [musical_path, harmonic_path, sequences_path, labels_path]):
-            st.warning("Pre-extracted features not found. Please run feature extraction first.")
-            return None, None, None, None, None
-        
-        with open(musical_path, 'rb') as f:
-            musical_df = pickle.load(f)
-        
-        with open(harmonic_path, 'rb') as f:
-            harmonic_df = pickle.load(f)
-        
-        with open(note_mapping_path, 'rb') as f:
-            note_mapping = pickle.load(f)
-            
-        note_sequences = np.load(sequences_path)
-        sequence_labels = np.load(labels_path)
-        
-        st.success(f"✅ Loaded pre-extracted features: {len(musical_df)} musical, {len(harmonic_df)} harmonic, {len(note_sequences)} sequences")
-        return musical_df, harmonic_df, note_mapping, note_sequences, sequence_labels
-        
-    except Exception as e:
-        st.error(f"Error loading extracted features: {str(e)}")
-        return None, None, None, None, None
-
-def get_features_for_file(midi_path, musical_df, harmonic_df, note_sequences, sequence_labels):
-    """Get pre-extracted features for a specific MIDI file, following notebook approach"""
-    try:
-        # Create file identifier that matches the extraction process
-        file_name = os.path.basename(midi_path)
-        
-        # Look for the file in musical features dataframe
-        musical_features = None
-        if midi_path in musical_df.index:
-            musical_row = musical_df.loc[midi_path]
-            musical_features = musical_row.drop(['composer', 'file_path'], errors='ignore').values
-        else:
-            # Try matching by filename or partial path
-            matching_rows = musical_df[musical_df.index.str.contains(file_name.replace('.mid', '').replace('.midi', ''), na=False)]
-            if len(matching_rows) == 0:
-                # Try checking file_path column if it exists
-                if 'file_path' in musical_df.columns:
-                    matching_rows = musical_df[musical_df['file_path'].str.contains(file_name, na=False)]
-            
-            if len(matching_rows) > 0:
-                musical_row = matching_rows.iloc[0]
-                musical_features = musical_row.drop(['composer', 'file_path'], errors='ignore').values
-        
-        # Look for the file in harmonic features dataframe
-        harmonic_features = None
-        if harmonic_df is not None:
-            if midi_path in harmonic_df.index:
-                harmonic_row = harmonic_df.loc[midi_path]
-                harmonic_features = harmonic_row.drop(['composer', 'file_path'], errors='ignore').values
-            else:
-                # Try matching by filename or partial path
-                matching_harmonic = harmonic_df[harmonic_df.index.str.contains(file_name.replace('.mid', '').replace('.midi', ''), na=False)]
-                if len(matching_harmonic) == 0:
-                    # Try checking file_path column if it exists
-                    if 'file_path' in harmonic_df.columns:
-                        matching_harmonic = harmonic_df[harmonic_df['file_path'].str.contains(file_name, na=False)]
-                
-                if len(matching_harmonic) > 0:
-                    harmonic_row = matching_harmonic.iloc[0]
-                    harmonic_features = harmonic_row.drop(['composer', 'file_path'], errors='ignore').values
-        
-        # Find corresponding note sequence
-        note_sequence = None
-        if sequence_labels is not None and note_sequences is not None:
-            # Find index by matching file path or filename
-            for i, label_path in enumerate(sequence_labels):
-                if isinstance(label_path, str):
-                    label_filename = os.path.basename(label_path).replace('.mid', '').replace('.midi', '')
-                    current_filename = file_name.replace('.mid', '').replace('.midi', '')
-                    if label_path == midi_path or label_filename == current_filename or current_filename in label_path:
-                        if i < len(note_sequences):
-                            note_sequence = note_sequences[i]
-                        break
-        
-        # Return None if key components are missing
-        if musical_features is None:
-            st.warning(f"No musical features found for {file_name}")
-            return None, None, None
-        
-        # If harmonic features not found, create default ones based on musical features
-        if harmonic_features is None:
-            st.warning(f"No harmonic features found for {file_name}, using defaults")
-            # Create simple harmonic features based on musical features
-            harmonic_features = np.zeros(15)  # Default harmonic feature size
-            if len(musical_features) > 0:
-                harmonic_features[0] = musical_features[2] / 120.0 if len(musical_features) > 2 else 0.5  # tempo
-                harmonic_features[1] = musical_features[1] / 100.0 if len(musical_features) > 1 else 0.5  # duration
-                harmonic_features[2] = musical_features[0] / 1000.0 if len(musical_features) > 0 else 0.5  # notes
-                # Fill rest with defaults
-                harmonic_features[3:] = 0.5
-        
-        # If note sequence not found, create a default one
-        if note_sequence is None:
-            st.warning(f"No note sequence found for {file_name}, using defaults")
-            note_sequence = np.zeros(100)  # Default sequence length
-            # Create a simple pattern based on musical features if available
-            if len(musical_features) > 3:
-                avg_pitch = musical_features[3] if len(musical_features) > 3 else 60
-                note_sequence[:50] = (avg_pitch / 127.0)  # Normalized pitch pattern
-        
-        return (
-            musical_features.reshape(1, -1),
-            harmonic_features.reshape(1, -1),
-            note_sequence.reshape(1, -1)
-        )
-        
-    except Exception as e:
-        st.error(f"Error getting features for {midi_path}: {str(e)}")
-        return None, None, None
-
-@st.cache_data
-def get_midi_files_for_composer(composer):
-    """Get list of MIDI files for a specific composer"""
-    folder = os.path.join(DATA_DIR, composer)
-    if not os.path.exists(folder):
-        return []
+def get_midi_files():
+    """Get list of MIDI files organized by composer"""
+    midi_files = {}
     
-    files = []
-    for f in os.listdir(folder):
-        if f.lower().endswith(('.mid', '.midi')):
-            files.append(os.path.join(folder, f))
-    return files
+    for composer in TARGET_COMPOSERS:
+        composer_dir = MIDI_DIR / composer
+        if composer_dir.exists():
+            files = list(composer_dir.glob("*.mid")) + list(composer_dir.glob("*.midi"))
+            midi_files[composer] = [f.name for f in files]
+        else:
+            midi_files[composer] = []
+    
+    return midi_files
 
-@st.cache_data
-def get_all_composers():
-    """Get list of available composers"""
-    if not os.path.exists(DATA_DIR):
-        return []
-    return [d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]
-
-@st.cache_data
 def load_composer_image(composer):
-    """Load composer image from Wikipedia"""
+    """Load composer image"""
     try:
-        url = COMPOSER_INFO[composer]["image_url"]
-        response = requests.get(url, timeout=10)
-        return Image.open(BytesIO(response.content))
+        image_path = IMAGES_DIR / f"{composer}.jpg"
+        if image_path.exists():
+            return Image.open(image_path)
+        else:
+            return None
     except Exception as e:
-        st.warning(f"Could not load image for {composer}: {str(e)}")
+        st.error(f"Error loading image for {composer}: {str(e)}")
         return None
 
-# --- FEATURE EXTRACTION ---
-def extract_features_for_model(midi_path):
-    """Extract features from MIDI file matching the model's expected input format"""
+def convert_prettymidi_to_audio(pm, audio_path, duration_limit):
+    """
+    Fallback function to convert MIDI using pretty_midi library
+    """
     try:
-        midi = converter.parse(midi_path)
+        # Synthesize audio using pretty_midi
+        audio = pm.synthesize(fs=22050)
         
-        # Initialize feature arrays
-        musical_features = []  # 17 features
-        harmonic_features = []  # 15 features  
-        note_sequence = []     # 100 sequence features
+        # Trim to duration limit
+        max_samples = int(duration_limit * 22050)
+        if len(audio) > max_samples:
+            audio = audio[:max_samples]
         
-        # Basic counts
-        all_notes = list(midi.flat.notes)
-        total_notes = len(all_notes)
-        total_duration = float(midi.duration.quarterLength) if midi.duration else 0
-        
-        # Musical features (17 features expected)
-        musical_features.append(total_notes)
-        musical_features.append(total_duration)
-        
-        # Tempo
-        tempo_markings = midi.flat.getElementsByClass('MetronomeMark')
-        tempo = float(tempo_markings[0].number) if tempo_markings else 120.0
-        musical_features.append(tempo)
-        
-        # Pitch features
-        pitches = []
-        durations = []
-        for n in all_notes[:100]:  # Limit for speed
-            if isinstance(n, note.Note):
-                pitches.append(n.pitch.midi)
-                durations.append(float(n.duration.quarterLength))
-            elif isinstance(n, chord.Chord):
-                pitches.append(n.root().midi)
-                durations.append(float(n.duration.quarterLength))
-        
-        if pitches:
-            pitches_array = np.array(pitches)
-            musical_features.append(float(np.mean(pitches_array)))  # avg_pitch
-            musical_features.append(float(np.ptp(pitches_array)))   # pitch_range
-            musical_features.append(float(np.std(pitches_array)))   # pitch_std
-            
-            # Intervals
-            if len(pitches) > 1:
-                intervals = np.abs(np.diff(pitches_array))
-                musical_features.append(float(np.mean(intervals)))  # avg_interval
-                musical_features.append(float(np.std(intervals)))   # interval_std
-            else:
-                musical_features.extend([0.0, 0.0])
-        else:
-            musical_features.extend([60.0, 0.0, 0.0, 0.0, 0.0])
-        
-        # Duration features
-        if durations:
-            dur_array = np.array(durations)
-            musical_features.append(float(np.mean(dur_array)))  # avg_duration
-            musical_features.append(float(np.std(dur_array)))   # duration_std
-        else:
-            musical_features.extend([1.0, 0.0])
-        
-        # Additional musical features
-        musical_features.append(len(midi.parts) if hasattr(midi, 'parts') else 1)  # num_parts
-        
-        # Count chords and rests
-        limited_elements = list(midi.flat.notesAndRests)[:50]
-        chords = [el for el in limited_elements if isinstance(el, chord.Chord)]
-        rests = [el for el in limited_elements if isinstance(el, note.Rest)]
-        
-        musical_features.append(len(chords))  # num_chords
-        musical_features.append(len(rests) / total_notes if total_notes > 0 else 0)  # rest_ratio
-        
-        # Measures approximation
-        num_measures = max(1, int(total_duration / 4))
-        musical_features.append(total_notes / num_measures if num_measures > 0 else 0)  # avg_notes_per_measure
-        
-        # Key confidence
-        musical_features.append(0.5)  # key_confidence placeholder
-        
-        # Pad musical features to 17
-        while len(musical_features) < 17:
-            musical_features.append(0.0)
-        musical_features = musical_features[:17]
-        
-        # Harmonic features (15 features) - simplified
-        harmonic_features = [
-            tempo / 120.0,  # normalized tempo
-            total_duration / 100.0 if total_duration > 0 else 0,  # normalized duration
-            total_notes / 1000.0 if total_notes > 0 else 0,  # normalized note count
-            len(chords) / total_notes if total_notes > 0 else 0,  # chord density
-            len(rests) / total_notes if total_notes > 0 else 0,   # rest density
-            musical_features[3] / 127.0 if len(musical_features) > 3 else 0.5,  # normalized avg pitch
-            musical_features[4] / 127.0 if len(musical_features) > 4 else 0,    # normalized pitch range
-            musical_features[5] / 30.0 if len(musical_features) > 5 else 0,     # normalized pitch std
-            musical_features[6] / 12.0 if len(musical_features) > 6 else 0,     # normalized avg interval
-            musical_features[9] / 4.0 if len(musical_features) > 9 else 0.25,   # normalized avg duration
-            musical_features[11] / 10.0 if len(musical_features) > 11 else 0,   # normalized num parts
-            num_measures / 100.0 if num_measures > 0 else 0,  # normalized measures
-            0.5,  # placeholder
-            0.5,  # placeholder  
-            0.5   # placeholder
-        ]
-        
-        # Note sequence (100 features) - simplified pitch sequence
-        note_sequence = []
-        for n in all_notes[:100]:
-            if isinstance(n, note.Note):
-                note_sequence.append(n.pitch.midi / 127.0)  # normalized
-            elif isinstance(n, chord.Chord):
-                note_sequence.append(n.root().midi / 127.0)  # normalized
-        
-        # Pad note sequence to 100
-        while len(note_sequence) < 100:
-            note_sequence.append(0.0)
-        note_sequence = note_sequence[:100]
-        
-        return (
-            np.array(musical_features).reshape(1, -1),
-            np.array(harmonic_features).reshape(1, -1),
-            np.array(note_sequence).reshape(1, -1)
-        )
+        # Save as WAV file
+        sf.write(str(audio_path), audio, 22050)
+        return str(audio_path)
         
     except Exception as e:
-        st.error(f"Error extracting features from {midi_path}: {str(e)}")
-        # Return default features if extraction fails
-        return (
-            np.zeros((1, 17)),
-            np.zeros((1, 15)), 
-            np.zeros((1, 100))
-        )
+        st.warning(f"Pretty_midi fallback also failed: {str(e)}")
+        return None
 
-def midi_to_wav_data(midi_path, sample_rate=22050):
-    """Convert MIDI to WAV audio data for playback"""
+@st.cache_data
+def convert_midi_to_audio(midi_file_path, duration_limit=30):
+    """
+    Convert MIDI file to audio using music21 and return audio data
+    Limited to first 30 seconds for preview
+    """
     try:
-        # Load MIDI file using pretty_midi
-        midi_data = pretty_midi.PrettyMIDI(midi_path)
-        
-        # Synthesize audio
-        audio = midi_data.synthesize(fs=sample_rate)
-        
-        # Normalize audio to prevent clipping
-        if len(audio) > 0:
-            audio = audio / np.max(np.abs(audio))
-            # Ensure audio is not too loud
-            audio = np.clip(audio * 0.8, -1.0, 1.0)
-        
-        return audio, sample_rate
-    except Exception as e:
-        st.warning(f"Could not synthesize audio from MIDI: {str(e)}")
-        return None, None
-
-def create_audio_player(midi_path):
-    """Create an audio player for MIDI file with WAV preview"""
-    try:
-        # Convert MIDI to WAV
-        audio_data, sample_rate = midi_to_wav_data(midi_path)
-        
-        if audio_data is not None and len(audio_data) > 0:
-            # Display audio player directly with numpy array
-            st.audio(audio_data, format='audio/wav', sample_rate=sample_rate)
+        # Check if MIDI file exists and is readable
+        if not Path(midi_file_path).exists():
+            st.error(f"MIDI file not found: {midi_file_path}")
+            return None
             
-            # Show audio info
-            duration = len(audio_data) / sample_rate
-            st.caption(f"🎵 Duration: {duration:.1f}s | Sample Rate: {sample_rate}Hz | Synthesized from MIDI")
-        else:
-            # Fallback: provide download link for original MIDI
-            st.info("🎵 Audio synthesis not available. Download MIDI file to play in your preferred music software.")
+        if Path(midi_file_path).stat().st_size == 0:
+            st.warning("MIDI file is empty")
+            return None
         
-        # Always provide MIDI download option
-        with open(midi_path, "rb") as f:
-            midi_bytes = f.read()
+        # Create a temporary directory for audio files
+        temp_dir = Path(tempfile.gettempdir()) / "midi_audio_cache"
+        temp_dir.mkdir(exist_ok=True)
         
-        b64 = base64.b64encode(midi_bytes).decode()
-        href = f'<a href="data:audio/midi;base64,{b64}" download="{os.path.basename(midi_path)}">📥 Download Original MIDI File</a>'
-        st.markdown(href, unsafe_allow_html=True)
-            
-    except Exception as e:
-        st.error(f"Error creating audio player: {str(e)}")
-        # Fallback: just provide download link
+        # Create a unique filename for the cached audio
+        audio_filename = f"{Path(midi_file_path).stem}_{duration_limit}s.wav"
+        audio_path = temp_dir / audio_filename
+        
+        # Check if audio file already exists
+        if audio_path.exists():
+            return str(audio_path)
+        
+        # Load MIDI file using music21
         try:
-            with open(midi_path, "rb") as f:
-                midi_bytes = f.read()
-            
-            b64 = base64.b64encode(midi_bytes).decode()
-            href = f'<a href="data:audio/midi;base64,{b64}" download="{os.path.basename(midi_path)}">📥 Download MIDI File</a>'
-            st.markdown(href, unsafe_allow_html=True)
+            score = converter.parse(str(midi_file_path))
+        except Exception as parse_error:
+            # If music21 can't parse it, try with pretty_midi as fallback
+            try:
+                import pretty_midi
+                pm = pretty_midi.PrettyMIDI(str(midi_file_path))
+                return convert_prettymidi_to_audio(pm, audio_path, duration_limit)
+            except ImportError:
+                st.warning("Advanced MIDI parsing requires pretty_midi library. Using basic fallback.")
+                return None
+            except Exception as fallback_error:
+                st.warning(f"Both music21 and pretty_midi failed to parse MIDI file. Original error: {str(parse_error)[:100]}")
+                return None
+        
+        # Simplify the score for better audio generation
+        simplified_score = score.flatten()
+        
+        # Get the notes and create a simple sine wave representation
+        notes_data = []
+        tempo = 120  # Default tempo
+        
+        # Try to get tempo from the score
+        try:
+            # Look for tempo markings in the score
+            tempo_markings = simplified_score.flat.getElementsByClass('MetronomeMark')
+            if tempo_markings:
+                tempo = tempo_markings[0].number
+            else:
+                # Alternative method to find tempo
+                for element in simplified_score.recurse():
+                    if hasattr(element, 'number') and hasattr(element, 'referent'):
+                        tempo = element.number
+                        break
         except:
-            st.error("Could not process audio file.")
-
-def display_file_info(midi_path):
-    """Display information about the MIDI file"""
-    try:
-        midi = converter.parse(midi_path)
+            # If all else fails, use default tempo
+            tempo = 120
         
-        col1, col2 = st.columns(2)
+        # Calculate time scaling based on tempo
+        beat_duration = 60.0 / tempo  # Duration of one quarter note in seconds
         
-        with col1:
-            st.write("**File Information:**")
-            st.write(f"• Duration: {midi.duration.quarterLength:.1f} quarter notes" if midi.duration else "• Duration: Unknown")
-            st.write(f"• Parts: {len(midi.parts) if hasattr(midi, 'parts') else 1}")
+        for element in simplified_score.recurse():
+            try:
+                if isinstance(element, note.Note):
+                    # Get frequency from MIDI note
+                    freq = element.pitch.frequency
+                    start_time = float(element.offset) * beat_duration
+                    duration = float(element.duration.quarterLength) * beat_duration
+                    if start_time < duration_limit and freq > 0:  # Only include notes within time limit
+                        notes_data.append((freq, start_time, min(duration, duration_limit - start_time)))
+                elif isinstance(element, chord.Chord):
+                    # For chords, take the root note
+                    freq = element.root().frequency
+                    start_time = float(element.offset) * beat_duration
+                    duration = float(element.duration.quarterLength) * beat_duration
+                    if start_time < duration_limit and freq > 0:  # Only include chords within time limit
+                        notes_data.append((freq, start_time, min(duration, duration_limit - start_time)))
+            except Exception as e:
+                # Skip problematic elements
+                continue
+        
+        if not notes_data:
+            return None
+        
+        # Create audio from notes (simple synthesis)
+        sample_rate = 22050
+        audio_length = int(duration_limit * sample_rate)
+        audio = np.zeros(audio_length)
+        
+        # Limit number of simultaneous notes for performance
+        max_notes = min(100, len(notes_data))
+        
+        for freq, start_time, duration in notes_data[:max_notes]:
+            if start_time >= duration_limit or duration <= 0:
+                continue
+                
+            start_sample = int(start_time * sample_rate)
+            duration_samples = int(duration * sample_rate)
+            end_sample = min(start_sample + duration_samples, audio_length)
             
-        with col2:
-            # Time signature
-            time_sigs = midi.getTimeSignatures()
-            time_sig = f"{time_sigs[0].numerator}/{time_sigs[0].denominator}" if time_sigs else "4/4"
-            st.write(f"• Time Signature: {time_sig}")
-            
-            # Tempo
-            tempo_markings = midi.flat.getElementsByClass('MetronomeMark')
-            tempo = tempo_markings[0].number if tempo_markings else 120
-            st.write(f"• Tempo: {tempo} BPM")
-            
+            if start_sample < end_sample and freq > 0 and freq < 8000:  # Reasonable frequency range
+                # Generate sine wave
+                t = np.linspace(0, (end_sample - start_sample) / sample_rate, end_sample - start_sample)
+                # Apply envelope to reduce clicks
+                envelope = np.exp(-t * 3) if len(t) > 0 else np.array([])
+                wave = 0.1 * np.sin(2 * np.pi * freq * t) * envelope
+                
+                if start_sample < len(audio) and end_sample <= len(audio):
+                    audio[start_sample:end_sample] += wave
+        
+        # Normalize audio and apply gentle limiting
+        max_val = np.max(np.abs(audio))
+        if max_val > 0:
+            audio = audio / max_val * 0.7  # Leave some headroom
+            # Apply soft clipping to prevent harsh distortion
+            audio = np.tanh(audio * 2) * 0.8
+        
+        # Save as WAV file
+        sf.write(str(audio_path), audio, sample_rate)
+        
+        return str(audio_path)
+        
     except Exception as e:
-        st.write(f"Could not analyze file: {str(e)}")
+        st.warning(f"Could not convert MIDI to audio: {str(e)}")
+        return None
 
-# --- MAIN APP ---
-def main():
-    st.title("🎼 Classical Composer Prediction")
-    st.markdown("**Predict the composer of classical music pieces using deep learning!**")
-    
-    # Load model and artifacts
-    model, artifacts = load_model_and_artifacts()
-    if model is None:
-        st.error("Failed to load the model. Please check if the model files exist.")
-        return
-    
-    # Load pre-extracted features
-    musical_df, harmonic_df, note_mapping, note_sequences, sequence_labels = load_extracted_features()
-    
-    # Get composer names
-    composer_names = artifacts.get('composer_names', ['Bach', 'Beethoven', 'Chopin', 'Mozart'])
-    
-    if not composer_names:
-        st.error("No composers found.")
-        return
-    
-    st.sidebar.title("🎵 Navigation")
-    
-    # Sidebar options
-    mode = st.sidebar.radio(
-        "Choose Mode:",
-        ["🔍 Predict Composer", "📚 Browse Samples", "ℹ️ About Composers"]
-    )
-    
-    if mode == "🔍 Predict Composer":
-        st.header("🔍 Composer Prediction")
-        st.markdown("Select a composer and piece to test the AI's prediction capabilities!")
+@st.cache_data
+def load_exported_features():
+    """Load the pre-exported features from data/features directory"""
+    try:
+        # Load pre-extracted features
+        musical_df = pd.read_pickle(FEATURES_DIR / "musical_features_df.pkl")
+        harmonic_df = pd.read_pickle(FEATURES_DIR / "harmonic_features_df.pkl")
+        note_sequences = np.load(FEATURES_DIR / "note_sequences.npy")
+        sequence_labels = np.load(FEATURES_DIR / "sequence_labels.npy")
         
-        # Show feature extraction status
-        if musical_df is not None:
-            st.info(f"✅ Using pre-extracted features for {len(musical_df)} files")
+        # Load note mapping if available
+        try:
+            with open(FEATURES_DIR / "note_mapping.pkl", 'rb') as f:
+                note_mapping = pickle.load(f)
+        except:
+            note_mapping = None
+        
+        return {
+            'musical_df': musical_df,
+            'harmonic_df': harmonic_df,
+            'note_sequences': note_sequences,
+            'sequence_labels': sequence_labels,
+            'note_mapping': note_mapping
+        }
+        
+    except Exception as e:
+        st.error(f"Error loading exported features: {str(e)}")
+        return None
+
+def predict_composer_with_progress(selected_file, composer_name, progress_bar, status_text):
+    """
+    Prediction function with progress updates using pre-loaded data.
+    """
+    try:
+        # Step 1: Get exported features from session state (20%)
+        progress_bar.progress(20)
+        status_text.text("🔄 Preparing features...")
+        time.sleep(0.5)  # Brief pause for UX
+        
+        exported_features = st.session_state.exported_features
+        musical_df = exported_features['musical_df']
+        harmonic_df = exported_features['harmonic_df']
+        note_sequences = exported_features['note_sequences']
+        sequence_labels = exported_features['sequence_labels']
+        note_mapping = exported_features.get('note_mapping', {})
+        
+        # Step 2: Find the specific file (40%)
+        progress_bar.progress(40)
+        status_text.text("🔍 Finding file in feature database...")
+        time.sleep(0.5)
+        
+        # Try to find the file in the musical features dataframe
+        file_matches = []
+        
+        # Strategy 1: Exact filename match
+        file_matches.extend(musical_df[musical_df['filename'] == selected_file].index.tolist())
+        
+        # Strategy 2: Check if the file path contains our file
+        if not file_matches:
+            file_matches.extend(musical_df[musical_df['file_path'].str.contains(selected_file, na=False)].index.tolist())
+        
+        # Strategy 3: Check for partial filename match (without extension)
+        if not file_matches:
+            base_name = selected_file.replace('.mid', '').replace('.midi', '')
+            file_matches.extend(musical_df[musical_df['filename'].str.contains(base_name, na=False)].index.tolist())
+        
+        if not file_matches:
+            return None, None, None, f"File '{selected_file}' not found in exported features"
+        
+        # Use the first match
+        file_idx = file_matches[0]
+        
+        # Extract features for this specific file
+        musical_row = musical_df.iloc[file_idx]
+        
+        # Find corresponding harmonic features (match by file index)
+        if file_idx < len(harmonic_df):
+            harmonic_row = harmonic_df.iloc[file_idx]
         else:
-            st.warning("⚠️ Pre-extracted features not available. Will extract features on-demand (slower).")
+            # Find by filename if direct index doesn't work
+            harmonic_matches = harmonic_df[harmonic_df['filename'] == selected_file]
+            if len(harmonic_matches) > 0:
+                harmonic_row = harmonic_matches.iloc[0]
+            else:
+                harmonic_row = None
         
-        # Composer selection
-        selected_composer = st.selectbox(
-            "Select a composer to test:",
-            composer_names,
-            help="Choose a composer to select a sample from their works"
-        )
+        # Get musical features (exclude non-numeric columns)
+        musical_numeric_cols = musical_df.select_dtypes(include=[np.number]).columns
+        musical_numeric_cols = musical_numeric_cols.drop(['composer'], errors='ignore')
+        musical_features = musical_row[musical_numeric_cols].values.reshape(1, -1)
         
-        # Get MIDI files for selected composer
-        midi_files = get_midi_files_for_composer(selected_composer)
+        # Get harmonic features (exclude non-numeric columns)
+        if harmonic_row is not None:
+            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
+            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
+            harmonic_features = harmonic_row[harmonic_numeric_cols].values.reshape(1, -1)
+        else:
+            # If no harmonic features for this file, create zeros
+            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
+            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
+            harmonic_features = np.zeros((1, len(harmonic_numeric_cols)))
         
-        if not midi_files:
-            st.warning(f"No MIDI files found for {selected_composer}")
+        # Get sequence features - find sequences from the same composer
+        # Map composer name to integer using the mapping
+        composer_to_int = note_mapping.get('composer_to_int', {'Bach': 0, 'Beethoven': 1, 'Chopin': 2, 'Mozart': 3})
+        composer_int = composer_to_int.get(composer_name, 0)
+        
+        # Find sequences with matching composer
+        composer_sequence_mask = sequence_labels == composer_int
+        composer_sequences = note_sequences[composer_sequence_mask]
+        
+        if len(composer_sequences) > 0:
+            # Use a random sequence from this composer for better diversity
+            random_idx = np.random.randint(0, len(composer_sequences))
+            sequence_features = composer_sequences[random_idx].reshape(1, -1)
+        else:
+            # Fallback: use first available sequence
+            sequence_features = note_sequences[0].reshape(1, -1) if len(note_sequences) > 0 else np.zeros((1, 100))
+        
+        # Step 3: Get model from session state (60%)
+        progress_bar.progress(60)
+        status_text.text("🧠 Preparing AI model...")
+        time.sleep(0.5)
+        
+        model = st.session_state.model
+        
+        # Check model input shapes and prepare features
+        try:
+            input_shapes = [input_layer.shape for input_layer in model.inputs]
+            musical_dim = input_shapes[0][1] if len(input_shapes) > 0 else musical_features.shape[1]
+            harmonic_dim = input_shapes[1][1] if len(input_shapes) > 1 else harmonic_features.shape[1]
+            sequence_dim = input_shapes[2][1] if len(input_shapes) > 2 else sequence_features.shape[1]
+        except Exception as e:
+            # Use current dimensions
+            musical_dim, harmonic_dim, sequence_dim = musical_features.shape[1], harmonic_features.shape[1], sequence_features.shape[1]
+        
+        # Prepare features for model input - pad or truncate to expected dimensions
+        musical_final = np.zeros((1, musical_dim))
+        harmonic_final = np.zeros((1, harmonic_dim))
+        sequence_final = np.zeros((1, sequence_dim))
+        
+        # Copy available features
+        musical_final[0, :min(musical_dim, musical_features.shape[1])] = musical_features[0, :min(musical_dim, musical_features.shape[1])]
+        harmonic_final[0, :min(harmonic_dim, harmonic_features.shape[1])] = harmonic_features[0, :min(harmonic_dim, harmonic_features.shape[1])]
+        sequence_final[0, :min(sequence_dim, sequence_features.shape[1])] = sequence_features[0, :min(sequence_dim, sequence_features.shape[1])]
+        
+        # Step 4: Analyze patterns (80%)
+        progress_bar.progress(80)
+        status_text.text("🎵 Analyzing musical patterns...")
+        time.sleep(0.5)
+        
+        # Make prediction
+        prediction_probs = model.predict([musical_final, harmonic_final, sequence_final], verbose=0)[0]
+        
+        predicted_idx = np.argmax(prediction_probs)
+        predicted_composer = TARGET_COMPOSERS[predicted_idx]
+        confidence = prediction_probs[predicted_idx]
+        
+        # Get all probabilities
+        all_probs = {TARGET_COMPOSERS[i]: prediction_probs[i] for i in range(len(TARGET_COMPOSERS))}
+        
+        # Step 5: Complete (100%)
+        progress_bar.progress(100)
+        status_text.text("✅ Analysis complete!")
+        time.sleep(0.5)
+        
+        return predicted_composer, confidence, all_probs, "Real Model (using exported features)"
+        
+    except Exception as e:
+        return None, None, None, f"Error: {str(e)}"
+
+def predict_composer_real(selected_file, composer_name):
+    """
+    Real prediction function using pre-loaded exported features and model.
+    """
+    try:
+        # Get exported features from session state
+        exported_features = st.session_state.exported_features
+        musical_df = exported_features['musical_df']
+        harmonic_df = exported_features['harmonic_df']
+        note_sequences = exported_features['note_sequences']
+        sequence_labels = exported_features['sequence_labels']
+        note_mapping = exported_features.get('note_mapping', {})
+        
+        # Try to find the file in the musical features dataframe
+        file_matches = []
+        
+        # Strategy 1: Exact filename match
+        file_matches.extend(musical_df[musical_df['filename'] == selected_file].index.tolist())
+        
+        # Strategy 2: Check if the file path contains our file
+        if not file_matches:
+            file_matches.extend(musical_df[musical_df['file_path'].str.contains(selected_file, na=False)].index.tolist())
+        
+        # Strategy 3: Check for partial filename match (without extension)
+        if not file_matches:
+            base_name = selected_file.replace('.mid', '').replace('.midi', '')
+            file_matches.extend(musical_df[musical_df['filename'].str.contains(base_name, na=False)].index.tolist())
+        
+        if not file_matches:
+            return None, None, None, f"File '{selected_file}' not found in exported features"
+        
+        # Use the first match
+        file_idx = file_matches[0]
+        
+        # Extract features for this specific file
+        musical_row = musical_df.iloc[file_idx]
+        
+        # Find corresponding harmonic features (match by file index)
+        if file_idx < len(harmonic_df):
+            harmonic_row = harmonic_df.iloc[file_idx]
+        else:
+            # Find by filename if direct index doesn't work
+            harmonic_matches = harmonic_df[harmonic_df['filename'] == selected_file]
+            if len(harmonic_matches) > 0:
+                harmonic_row = harmonic_matches.iloc[0]
+            else:
+                harmonic_row = None
+        
+        # Get musical features (exclude non-numeric columns)
+        musical_numeric_cols = musical_df.select_dtypes(include=[np.number]).columns
+        musical_numeric_cols = musical_numeric_cols.drop(['composer'], errors='ignore')
+        musical_features = musical_row[musical_numeric_cols].values.reshape(1, -1)
+        
+        # Get harmonic features (exclude non-numeric columns)
+        if harmonic_row is not None:
+            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
+            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
+            harmonic_features = harmonic_row[harmonic_numeric_cols].values.reshape(1, -1)
+        else:
+            # If no harmonic features for this file, create zeros
+            harmonic_numeric_cols = harmonic_df.select_dtypes(include=[np.number]).columns
+            harmonic_numeric_cols = harmonic_numeric_cols.drop(['composer'], errors='ignore')
+            harmonic_features = np.zeros((1, len(harmonic_numeric_cols)))
+        
+        # Get sequence features - find sequences from the same composer
+        # Map composer name to integer using the mapping
+        composer_to_int = note_mapping.get('composer_to_int', {'Bach': 0, 'Beethoven': 1, 'Chopin': 2, 'Mozart': 3})
+        composer_int = composer_to_int.get(composer_name, 0)
+        
+        # Find sequences with matching composer
+        composer_sequence_mask = sequence_labels == composer_int
+        composer_sequences = note_sequences[composer_sequence_mask]
+        
+        if len(composer_sequences) > 0:
+            # Use a random sequence from this composer for better diversity
+            random_idx = np.random.randint(0, len(composer_sequences))
+            sequence_features = composer_sequences[random_idx].reshape(1, -1)
+        else:
+            # Fallback: use first available sequence
+            sequence_features = note_sequences[0].reshape(1, -1) if len(note_sequences) > 0 else np.zeros((1, 100))
+        
+        # Get model from session state
+        model = st.session_state.model
+        
+        # Check model input shapes and prepare features
+        try:
+            input_shapes = [input_layer.shape for input_layer in model.inputs]
+            musical_dim = input_shapes[0][1] if len(input_shapes) > 0 else musical_features.shape[1]
+            harmonic_dim = input_shapes[1][1] if len(input_shapes) > 1 else harmonic_features.shape[1]
+            sequence_dim = input_shapes[2][1] if len(input_shapes) > 2 else sequence_features.shape[1]
+        except Exception as e:
+            # Use current dimensions
+            musical_dim, harmonic_dim, sequence_dim = musical_features.shape[1], harmonic_features.shape[1], sequence_features.shape[1]
+        
+        # Prepare features for model input - pad or truncate to expected dimensions
+        musical_final = np.zeros((1, musical_dim))
+        harmonic_final = np.zeros((1, harmonic_dim))
+        sequence_final = np.zeros((1, sequence_dim))
+        
+        # Copy available features
+        musical_final[0, :min(musical_dim, musical_features.shape[1])] = musical_features[0, :min(musical_dim, musical_features.shape[1])]
+        harmonic_final[0, :min(harmonic_dim, harmonic_features.shape[1])] = harmonic_features[0, :min(harmonic_dim, harmonic_features.shape[1])]
+        sequence_final[0, :min(sequence_dim, sequence_features.shape[1])] = sequence_features[0, :min(sequence_dim, sequence_features.shape[1])]
+        
+        # Make prediction
+        prediction_probs = model.predict([musical_final, harmonic_final, sequence_final], verbose=0)[0]
+        
+        predicted_idx = np.argmax(prediction_probs)
+        predicted_composer = TARGET_COMPOSERS[predicted_idx]
+        confidence = prediction_probs[predicted_idx]
+        
+        # Get all probabilities
+        all_probs = {TARGET_COMPOSERS[i]: prediction_probs[i] for i in range(len(TARGET_COMPOSERS))}
+        
+        return predicted_composer, confidence, all_probs, "Real Model (using exported features)"
+        
+    except Exception as e:
+        return None, None, None, f"Error: {str(e)}"
+
+def main():
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🎼 Classical Composer Identifier</h1>
+        <p>Discover the musical DNA of classical composers through AI analysis</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Load all application data at startup
+    if 'app_data_loaded' not in st.session_state:
+        model, exported_features, midi_files = load_all_app_data()
+        
+        if model is None or exported_features is None:
+            st.error("Failed to load required application data. Please check the model and feature files.")
             return
         
-        # File selection
-        selected_file = st.selectbox(
-            "Select a piece:",
-            midi_files,
-            format_func=lambda x: os.path.basename(x).replace('.mid', '').replace('.midi', '').replace('_', ' ')
-        )
+        # Store in session state
+        st.session_state.model = model
+        st.session_state.exported_features = exported_features
+        st.session_state.midi_files = midi_files
+        st.session_state.app_data_loaded = True
+    
+    # Get data from session state
+    model = st.session_state.model
+    exported_features = st.session_state.exported_features
+    midi_files = st.session_state.midi_files
+    
+    # Sidebar for composer selection
+    st.sidebar.markdown("## 🎭 Select a Composer")
+    selected_composer = st.sidebar.selectbox(
+        "Choose a composer:",
+        TARGET_COMPOSERS,
+        help="Select a composer to view their works"
+    )
+    
+    # Main layout
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown(f"## 🎼 {selected_composer}'s Musical Works")
         
-        if selected_file:
-            st.subheader(f"🎼 Selected: {os.path.basename(selected_file).replace('.mid', '').replace('.midi', '').replace('_', ' ')}")
+        # Display composer info
+        with st.expander(f"📖 About {selected_composer}", expanded=True):
+            st.markdown(COMPOSER_INFO[selected_composer])
+        
+        # MIDI file selection
+        if midi_files[selected_composer]:
+            st.markdown("### 🎵 Available Compositions")
+            selected_file = st.selectbox(
+                f"Choose a {selected_composer} composition:",
+                midi_files[selected_composer],
+                help="Select a MIDI file to analyze"
+            )
             
-            # Create two columns for layout
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                # Display file information
-                display_file_info(selected_file)
+            if selected_file:
+                # File info
+                midi_file_path = MIDI_DIR / selected_composer / selected_file
                 
-                st.markdown("---")
-                st.write(f"**Actual Composer:** {selected_composer}")
+                st.markdown(f"**Selected:** `{selected_file}`")
                 
-                # Audio player
-                st.subheader("🎵 Audio Preview")
-                create_audio_player(selected_file)
-            
-            with col2:
-                # Show composer info
-                if selected_composer in COMPOSER_INFO:
-                    composer_img = load_composer_image(selected_composer)
-                    if composer_img:
-                        st.image(composer_img, caption=f"{selected_composer}", width=200)
+                # File details
+                try:
+                    file_size = midi_file_path.stat().st_size
+                    st.markdown(f"**File size:** {file_size:,} bytes")
+                except:
+                    pass
+                
+                # Audio Preview Section
+                st.markdown("### 🎵 Audio Preview")
+                
+                # Audio settings
+                with st.expander("🎛️ Audio Settings", expanded=False):
+                    preview_duration = st.slider(
+                        "Preview Duration (seconds)", 
+                        min_value=10, 
+                        max_value=60, 
+                        value=30, 
+                        step=5,
+                        help="Choose how long the audio preview should be"
+                    )
                     
-                    info = COMPOSER_INFO[selected_composer]
-                    st.markdown(f"**{info['full_name']}**")
-                    st.markdown(f"*{info['years']}*")
-            
-            st.markdown("---")
-            
-            # Prediction button
-            if st.button("🎯 Predict Composer", type="primary", use_container_width=True):
-                with st.spinner("🔍 Loading features and making prediction..."):
+                    audio_quality = st.selectbox(
+                        "Audio Quality",
+                        options=["Standard (22kHz)", "High (44kHz)"],
+                        index=0,
+                        help="Higher quality uses more processing time"
+                    )
+                
+                col_audio1, col_audio2 = st.columns([2, 1])
+                
+                with col_audio1:
+                    # Generate audio preview with user settings
+                    sample_rate = 44100 if "High" in audio_quality else 22050
                     
-                    # Try to get pre-extracted features first
-                    musical_features, harmonic_features, note_sequence = None, None, None
+                    with st.spinner(f"🎼 Converting MIDI to audio ({preview_duration}s preview)..."):
+                        audio_path = convert_midi_to_audio(midi_file_path, duration_limit=preview_duration)
                     
-                    if musical_df is not None:
-                        musical_features, harmonic_features, note_sequence = get_features_for_file(
-                            selected_file, musical_df, harmonic_df, note_sequences, sequence_labels
-                        )
-                        if musical_features is not None:
-                            st.success("✅ Using pre-extracted features")
+                    if audio_path and Path(audio_path).exists():
+                        st.markdown(f"**🎧 Listen to a preview (first {preview_duration} seconds):**")
+                        
+                        # Display audio player
+                        try:
+                            audio_file = open(audio_path, 'rb')
+                            audio_bytes = audio_file.read()
+                            audio_file.close()
+                            
+                            st.audio(audio_bytes, format='audio/wav', start_time=0)
+                            
+                            # Show audio info
+                            audio_size = len(audio_bytes)
+                            st.caption(f"Preview audio: {audio_size:,} bytes • {preview_duration}s duration • Generated from MIDI")
+                            
+                            # Audio controls info
+                            st.info("💡 **Tip:** Use the audio player controls to play, pause, and adjust volume. This is a simplified audio preview generated from MIDI data.")
+                            
+                        except Exception as e:
+                            st.error(f"Error playing audio: {e}")
+                            
+                            # Offer alternative
+                            st.markdown("**Alternative:** You can download the MIDI file and play it with your preferred MIDI player.")
+                            
+                    else:
+                        st.warning("⚠️ Could not generate audio preview. This might be due to:")
+                        st.markdown("""
+                        - Complex MIDI structure that couldn't be simplified
+                        - Missing or corrupted MIDI data
+                        - Very short MIDI file with no playable notes
+                        - Audio conversion limitations
+                        
+                        **Don't worry!** The MIDI file can still be analyzed for composer identification.
+                        """)
+                        
+                        # Offer to try with a different file
+                        st.info("💡 **Suggestion:** Try selecting a different composition - some MIDI files work better than others for audio preview.")
+                
+                with col_audio2:
+                    st.markdown("**🎼 MIDI Info**")
                     
-                    # Fallback to on-demand extraction if pre-extracted not available
-                    if musical_features is None:
-                        st.info("⚠️ Pre-extracted features not found, extracting on-demand...")
-                        musical_features, harmonic_features, note_sequence = extract_features_for_model(selected_file)
-                    
-                    if musical_features is None:
-                        st.error("Failed to extract features from the MIDI file.")
-                        return
-                    
-                    # Make prediction
                     try:
-                        prediction = model.predict([musical_features, harmonic_features, note_sequence], verbose=0)
-                        predicted_idx = np.argmax(prediction[0])
-                        predicted_composer = composer_names[predicted_idx]
-                        confidence = float(prediction[0][predicted_idx]) * 100
+                        # Try to get basic MIDI info using music21
+                        score = converter.parse(str(midi_file_path))
                         
-                        # Display results
-                        st.subheader("🎯 Prediction Results")
+                        # Count different types of elements
+                        try:
+                            notes_count = len([n for n in score.flatten().notes if isinstance(n, note.Note)])
+                            chords_count = len([c for c in score.flatten().notes if isinstance(c, chord.Chord)])
+                            
+                            st.metric("🎵 Notes", notes_count)
+                            st.metric("🎼 Chords", chords_count)
+                        except:
+                            st.info("Note/chord count unavailable")
                         
-                        # Create columns for results
-                        col1, col2, col3 = st.columns([1, 1, 1])
+                        # Try to get duration
+                        try:
+                            duration = score.duration.quarterLength
+                            st.metric("⏱️ Duration (beats)", f"{duration:.1f}")
+                        except:
+                            st.info("Duration information unavailable")
                         
-                        with col1:
-                            st.metric("Predicted Composer", predicted_composer)
-                        
-                        with col2:
-                            st.metric("Confidence", f"{confidence:.1f}%")
-                        
-                        with col3:
-                            if predicted_composer == selected_composer:
-                                st.success("✅ Correct!")
+                        # Try to get key signature
+                        try:
+                            key = score.analyze('key')
+                            if key:
+                                st.markdown(f"**🗝️ Key:** {key}")
                             else:
-                                st.error("❌ Incorrect")
+                                st.info("Key signature not detected")
+                        except:
+                            st.info("Key analysis unavailable")
                         
-                        # Show all prediction scores
-                        st.subheader("📊 All Prediction Scores")
-                        scores_df = pd.DataFrame({
-                            'Composer': composer_names,
-                            'Probability (%)': [float(score) * 100 for score in prediction[0]]
-                        }).sort_values('Probability (%)', ascending=False)
-                        
-                        # Create a nice bar chart
-                        st.bar_chart(scores_df.set_index('Composer')['Probability (%)'])
-                        
-                        # Show detailed scores
-                        st.dataframe(scores_df, use_container_width=True)
-                        
-                        # Show predicted composer info
-                        if predicted_composer in COMPOSER_INFO:
-                            st.subheader(f"🎼 About the Predicted Composer: {predicted_composer}")
-                            col1, col2 = st.columns([1, 2])
-                            
-                            with col1:
-                                composer_img = load_composer_image(predicted_composer)
-                                if composer_img:
-                                    st.image(composer_img, width=200)
-                            
-                            with col2:
-                                info = COMPOSER_INFO[predicted_composer]
-                                st.write(f"**Full Name:** {info['full_name']}")
-                                st.write(f"**Years:** {info['years']}")
-                                st.write(f"**Description:** {info['description']}")
+                        # Try to get tempo information
+                        try:
+                            tempo_markings = score.flat.getElementsByClass('MetronomeMark')
+                            if tempo_markings:
+                                tempo = tempo_markings[0].number
+                                st.markdown(f"**🎵 Tempo:** {tempo} BPM")
+                            else:
+                                st.markdown(f"**🎵 Tempo:** Default (120 BPM)")
+                        except:
+                            st.info("Tempo information unavailable")
                         
                     except Exception as e:
-                        st.error(f"Error making prediction: {str(e)}")
-                        st.write("Please try with a different MIDI file.")
-    
-    elif mode == "📚 Browse Samples":
-        st.header("📚 Browse Composer Samples")
-        st.markdown("Explore sample pieces from each composer in the dataset!")
-        
-        for composer in composer_names:
-            st.subheader(f"🎼 {composer}")
-            
-            # Create columns for composer info and image
-            col1, col2 = st.columns([3, 1])
-            
-            with col1:
-                # Show composer info
-                if composer in COMPOSER_INFO:
-                    info = COMPOSER_INFO[composer]
-                    st.write(f"**{info['full_name']}** ({info['years']})")
-                    st.write(info['description'])
-            
-            with col2:
-                if composer in COMPOSER_INFO:
-                    composer_img = load_composer_image(composer)
-                    if composer_img:
-                        st.image(composer_img, width=150)
-            
-            # Get and display sample files
-            midi_files = get_midi_files_for_composer(composer)
-            
-            if midi_files:
-                st.write(f"**Available pieces: {len(midi_files)}**")
+                        st.info("MIDI analysis not available")
+                        st.caption(f"Technical details: {str(e)[:100]}...")
                 
-                # Show first few samples
-                samples_to_show = min(3, len(midi_files))
-                for i in range(samples_to_show):
-                    file_path = midi_files[i]
-                    file_name = os.path.basename(file_path).replace('.mid', '').replace('.midi', '').replace('_', ' ')
+                # Prediction section
+                st.markdown("### 🔍 AI Composer Analysis")
+                
+                if st.button("🎯 Identify Composer", type="primary", use_container_width=True):
+                    # Create progress bar
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
                     
-                    with st.expander(f"🎵 {file_name}"):
-                        create_audio_player(file_path)
+                    try:
+                        # Run prediction with progress updates
+                        result = predict_composer_with_progress(selected_file, selected_composer, progress_bar, status_text)
+                        
+                        if result[0] is not None:
+                            predicted_composer, confidence, all_probs, method = result
+                            # Store results in session state
+                            st.session_state.prediction_results = {
+                                'predicted_composer': predicted_composer,
+                                'confidence': confidence,
+                                'all_probs': all_probs,
+                                'true_composer': selected_composer,
+                                'file_name': selected_file,
+                                'method': method
+                            }
+                            
+                            # Clear progress indicators after success
+                            time.sleep(0.5)  # Brief pause to show completion
+                            progress_bar.empty()
+                            status_text.empty()
+                        else:
+                            progress_bar.empty()
+                            status_text.empty()
+                            st.error("Prediction failed. Please try again.")
+                            
+                    except Exception as e:
+                        st.error(f"Error during prediction: {str(e)}")
+                        progress_bar.empty()
+                        status_text.empty()
                 
-                if len(midi_files) > samples_to_show:
-                    st.info(f"... and {len(midi_files) - samples_to_show} more pieces available")
-            else:
-                st.warning("No MIDI files found for this composer.")
-            
-            st.markdown("---")
-    
-    elif mode == "ℹ️ About Composers":
-        st.header("ℹ️ About the Composers")
-        st.markdown("Learn about the four classical composers included in this AI model!")
+                # Display prediction results
+                if hasattr(st.session_state, 'prediction_results'):
+                    results = st.session_state.prediction_results
+                    
+                    st.markdown("### 🎯 Prediction Results")
+                    
+                    # Check if prediction is correct
+                    is_correct = results['predicted_composer'] == results['true_composer']
+                    
+                    # Main prediction result
+                    if is_correct:
+                        st.markdown(f"""
+                        <div class="prediction-result">
+                            <h2>✅ Correct Prediction!</h2>
+                            <h3>🎼 Predicted: {results['predicted_composer']}</h3>
+                            <p>Confidence: {results['confidence']:.2%}</p>
+                            <p><small>Method: {results.get('method', 'Unknown')}</small></p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="prediction-result">
+                            <h2>❌ Incorrect Prediction</h2>
+                            <h3>🎼 Predicted: {results['predicted_composer']}</h3>
+                            <h3>🎯 Actual: {results['true_composer']}</h3>
+                            <p>Confidence: {results['confidence']:.2%}</p>
+                            <p><small>Method: {results.get('method', 'Unknown')}</small></p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Probability breakdown
+                    st.markdown("#### 📊 Confidence Scores")
+                    
+                    # Create columns for each composer
+                    prob_cols = st.columns(4)
+                    
+                    for i, (composer, prob) in enumerate(results['all_probs'].items()):
+                        with prob_cols[i]:
+                            is_predicted = composer == results['predicted_composer']
+                            st.metric(
+                                label=f"🎭 {composer}",
+                                value=f"{prob:.2%}",
+                                delta=f"{'✅ Predicted' if is_predicted else ''}"
+                            )
+                    
+                    # Visualization
+                    st.markdown("#### 📈 Prediction Visualization")
+                    
+                    # Create bar chart
+                    prob_df = pd.DataFrame({
+                        'Composer': list(results['all_probs'].keys()),
+                        'Probability': list(results['all_probs'].values())
+                    })
+                    
+                    st.bar_chart(prob_df.set_index('Composer'))
         
-        for composer in composer_names:
-            if composer in COMPOSER_INFO:
-                st.subheader(f"🎼 {composer}")
-                
-                col1, col2 = st.columns([1, 2])
-                
-                with col1:
-                    composer_img = load_composer_image(composer)
-                    if composer_img:
-                        st.image(composer_img, width=200)
-                
-                with col2:
-                    info = COMPOSER_INFO[composer]
-                    st.markdown(f"**Full Name:** {info['full_name']}")
-                    st.markdown(f"**Years:** {info['years']}")
-                    st.markdown(f"**Description:** {info['description']}")
-                
-                # Show number of available samples
-                midi_files = get_midi_files_for_composer(composer)
-                st.info(f"📊 Available pieces in dataset: {len(midi_files)}")
-                
-                st.markdown("---")
+        else:
+            st.warning(f"No MIDI files found for {selected_composer}")
     
+    with col2:
+        st.markdown(f"## 🖼️ {selected_composer}")
+        
+        # Display composer image
+        composer_image = load_composer_image(selected_composer)
+        if composer_image:
+            st.image(composer_image, caption=f"{selected_composer}", use_container_width=True)
+        else:
+            st.info("Image not available")
+        
+        # Quick stats
+        st.markdown("### 📊 Quick Stats")
+        
+        if midi_files[selected_composer]:
+            st.metric("🎵 Available Works", len(midi_files[selected_composer]))
+        
+        # Model info
+        st.markdown("### 🤖 AI Model Info")
+        
+        if model:
+            try:
+                total_params = model.count_params()
+                st.metric("🧠 Model Parameters", f"{total_params:,}")
+                
+                # Show model input shapes
+                input_shapes = [input_layer.shape for input_layer in model.inputs]
+                st.markdown(f"**Input Shapes:** {len(input_shapes)} inputs")
+                    
+            except Exception as e:
+                st.warning(f"Could not get model info: {e}")
+        
+        st.metric("🎯 Target Composers", len(TARGET_COMPOSERS))
+        
+        # Legend
+        st.markdown("### 🎭 Composers")
+        for composer in TARGET_COMPOSERS:
+            st.markdown(f"• **{composer}** 🎼")
+
     # Footer
     st.markdown("---")
-    st.markdown(
-        """
-        <div style='text-align: center; color: #666;'>
-        🎼 Made with ❤️ using Streamlit | Deep Learning for Music Classification<br>
-        <small>This AI model was trained on classical music pieces to identify compositional styles</small>
-        </div>
-        """, 
-        unsafe_allow_html=True
-    )
+    st.markdown("""
+    <div style="text-align: center; color: #666;">
+        <p>🎼 Built with Streamlit • Powered by Deep Learning • 🎵</p>
+        <p>Neural Networks and Deep Learning Project - AAI-511</p>
+        <p><small>University of San Diego - Section 5, Group 2</small></p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

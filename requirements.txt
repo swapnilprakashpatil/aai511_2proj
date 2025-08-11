@@ -26,3 +26,4 @@ scipy
 soundfile
 pydot
 graphviz
+wikipedia-api
