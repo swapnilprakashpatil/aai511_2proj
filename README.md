@@ -35,7 +35,12 @@ Identifying the composer of classical music pieces can be challenging, especiall
 
 ## Demo
 
-[🎼 Interactive Composer Prediction App](https://your-app-url.streamlit.app/)
+[🎼 Interactive Composer Prediction App](https://symbolicmusicai.streamlit.app/)
+### Demo Video
+
+<video src="./demo/Streamlit App.webm" controls width="700">
+   Your browser does not support the video tag.
+</video>
 
 ## Detailed Document
 
@@ -192,3 +197,6 @@ The trained model achieves:
 ## License
 
 This project is developed for educational purposes as part of the AAI-511 course at the University of San Diego.
+
+## Streamlit App Demo
+![Streamlit App Screenshot](./demo/StreamlitAppScreenshot.png)
